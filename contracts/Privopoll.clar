@@ -23,12 +23,20 @@
 (define-constant ERR_INVALID_DELEGATE (err u116))
 (define-constant ERR_REPUTATION_TOO_LOW (err u117))
 (define-constant ERR_INVALID_RATING (err u118))
+(define-constant ERR_TEMPLATE_NOT_FOUND (err u119))
+(define-constant ERR_CATEGORY_NOT_FOUND (err u120))
+(define-constant ERR_TEMPLATE_LIMIT_EXCEEDED (err u121))
+(define-constant ERR_INVALID_CATEGORY (err u122))
+(define-constant ERR_TEMPLATE_ALREADY_EXISTS (err u123))
 
 (define-data-var poll-counter uint u0)
 (define-data-var min-stake-amount uint u1000000)
 (define-data-var delegation-counter uint u0)
 (define-data-var min-reputation-score uint u50)
 (define-data-var max-delegations-per-user uint u5)
+(define-data-var template-counter uint u0)
+(define-data-var category-counter uint u0)
+(define-data-var max-templates-per-user uint u10)
 
 (define-map polls
   { poll-id: uint }
@@ -42,7 +50,9 @@
     reveal-end-block: uint,
     min-stake: uint,
     total-participants: uint,
-    status: (string-ascii 20)
+    status: (string-ascii 20),
+    category-id: uint,
+    template-id: (optional uint)
   }
 )
 
@@ -132,13 +142,73 @@
   }
 )
 
+;; Template and Category System
+(define-map poll-categories
+  { category-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    creator: principal,
+    created-block: uint,
+    poll-count: uint,
+    active: bool
+  }
+)
+
+(define-map poll-templates
+  { template-id: uint }
+  {
+    name: (string-ascii 80),
+    description: (string-ascii 300),
+    category-id: uint,
+    creator: principal,
+    default-options: (list 10 (string-ascii 50)),
+    suggested-duration: uint,
+    suggested-reveal-duration: uint,
+    suggested-min-stake: uint,
+    usage-count: uint,
+    rating-sum: uint,
+    rating-count: uint,
+    created-block: uint,
+    active: bool
+  }
+)
+
+(define-map template-usage
+  { template-id: uint, user: principal }
+  {
+    usage-count: uint,
+    last-used-block: uint,
+    rating: (optional uint)
+  }
+)
+
+(define-map user-templates
+  { user: principal }
+  {
+    created-templates: (list 10 uint),
+    template-count: uint
+  }
+)
+
+(define-map category-polls
+  { category-id: uint }
+  {
+    recent-polls: (list 50 uint),
+    total-polls: uint,
+    active-polls: uint
+  }
+)
+
 (define-public (create-poll 
   (title (string-ascii 100))
   (description (string-ascii 500))
   (options (list 10 (string-ascii 50)))
   (duration-blocks uint)
   (reveal-duration-blocks uint)
-  (min-stake uint))
+  (min-stake uint)
+  (category-id uint)
+  (template-id (optional uint)))
   (let
     (
       (poll-id (+ (var-get poll-counter) u1))
@@ -148,6 +218,17 @@
     )
     (asserts! (>= (len options) u2) ERR_INVALID_OPTION)
     (asserts! (>= min-stake (var-get min-stake-amount)) ERR_INSUFFICIENT_STAKE)
+    (asserts! (is-some (map-get? poll-categories { category-id: category-id })) ERR_CATEGORY_NOT_FOUND)
+    
+    ;; Update template usage if template is provided
+    (match template-id
+      template
+      (begin
+        (asserts! (is-some (map-get? poll-templates { template-id: template })) ERR_TEMPLATE_NOT_FOUND)
+        (update-template-usage template)
+      )
+      true
+    )
     
     (map-set polls
       { poll-id: poll-id }
@@ -161,9 +242,14 @@
         reveal-end-block: reveal-end-block,
         min-stake: min-stake,
         total-participants: u0,
-        status: "active"
+        status: "active",
+        category-id: category-id,
+        template-id: template-id
       }
     )
+    
+    ;; Update category poll count
+    (update-category-poll-count category-id poll-id)
     
     (var-set poll-counter poll-id)
     (ok poll-id)
@@ -359,7 +445,7 @@
     (map-set user-delegations
       { user: tx-sender }
       {
-        delegating-to: (filter remove-delegate (get delegating-to delegator-data)),
+        delegating-to: (get delegating-to delegator-data),
         delegated-from: (get delegated-from delegator-data),
         total-delegation-weight: (- (get total-delegation-weight delegator-data) (get delegation-weight delegation)),
         active-delegations: (- (get active-delegations delegator-data) u1)
@@ -370,7 +456,7 @@
       { user: delegate }
       {
         delegating-to: (get delegating-to delegate-data),
-        delegated-from: (filter remove-delegator (get delegated-from delegate-data)),
+        delegated-from: (get delegated-from delegate-data),
         total-delegation-weight: (get total-delegation-weight delegate-data),
         active-delegations: (get active-delegations delegate-data)
       }
@@ -457,6 +543,135 @@
           last-activity-block: (get last-activity-block delegate-rep)
         }
       )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Template and Category Management Functions
+(define-public (create-category (name (string-ascii 50)) (description (string-ascii 200)))
+  (let
+    (
+      (category-id (+ (var-get category-counter) u1))
+      (current-block stacks-block-height)
+    )
+    (map-set poll-categories
+      { category-id: category-id }
+      {
+        name: name,
+        description: description,
+        creator: tx-sender,
+        created-block: current-block,
+        poll-count: u0,
+        active: true
+      }
+    )
+    
+    (map-set category-polls
+      { category-id: category-id }
+      {
+        recent-polls: (list),
+        total-polls: u0,
+        active-polls: u0
+      }
+    )
+    
+    (var-set category-counter category-id)
+    (ok category-id)
+  )
+)
+
+(define-public (create-template 
+  (name (string-ascii 80))
+  (description (string-ascii 300))
+  (category-id uint)
+  (default-options (list 10 (string-ascii 50)))
+  (suggested-duration uint)
+  (suggested-reveal-duration uint)
+  (suggested-min-stake uint))
+  (let
+    (
+      (template-id (+ (var-get template-counter) u1))
+      (current-block stacks-block-height)
+      (user-data (get-user-template-data tx-sender))
+    )
+    (asserts! (is-some (map-get? poll-categories { category-id: category-id })) ERR_CATEGORY_NOT_FOUND)
+    (asserts! (>= (len default-options) u2) ERR_INVALID_OPTION)
+    (asserts! (< (get template-count user-data) (var-get max-templates-per-user)) ERR_TEMPLATE_LIMIT_EXCEEDED)
+    
+    (map-set poll-templates
+      { template-id: template-id }
+      {
+        name: name,
+        description: description,
+        category-id: category-id,
+        creator: tx-sender,
+        default-options: default-options,
+        suggested-duration: suggested-duration,
+        suggested-reveal-duration: suggested-reveal-duration,
+        suggested-min-stake: suggested-min-stake,
+        usage-count: u0,
+        rating-sum: u0,
+        rating-count: u0,
+        created-block: current-block,
+        active: true
+      }
+    )
+    
+    (map-set user-templates
+      { user: tx-sender }
+      {
+        created-templates: (unwrap-panic (as-max-len? (append (get created-templates user-data) template-id) u10)),
+        template-count: (+ (get template-count user-data) u1)
+      }
+    )
+    
+    (var-set template-counter template-id)
+    (ok template-id)
+  )
+)
+
+(define-public (rate-template (template-id uint) (rating uint))
+  (let
+    (
+      (template (unwrap! (map-get? poll-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+      (usage (map-get? template-usage { template-id: template-id, user: tx-sender }))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (is-some usage) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (get rating (unwrap-panic usage))) ERR_ALREADY_VOTED)
+    
+    (map-set template-usage
+      { template-id: template-id, user: tx-sender }
+      (merge (unwrap-panic usage) { rating: (some rating) })
+    )
+    
+    (let ((new-rating-sum (+ (get rating-sum template) rating))
+          (new-rating-count (+ (get rating-count template) u1)))
+      (map-set poll-templates
+        { template-id: template-id }
+        (merge template {
+          rating-sum: new-rating-sum,
+          rating-count: new-rating-count
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-template (template-id uint))
+  (let
+    (
+      (template (unwrap! (map-get? poll-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get creator template)) (is-eq tx-sender CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)
+    
+    (map-set poll-templates
+      { template-id: template-id }
+      (merge template { active: false })
     )
     
     (ok true)
@@ -578,35 +793,14 @@
   )
 )
 
-(define-private (remove-delegate (delegate principal))
-  (not (is-eq delegate delegate))
-)
 
-(define-private (remove-delegator (delegator principal))
-  (not (is-eq delegator delegator))
-)
 
 (define-private (process-delegated-commitments (poll-id uint) (delegator-commitments (list 20 {delegator: principal, commitment: (buff 32)})))
-  (filter is-valid-delegator-commitment (map validate-delegator-commitment delegator-commitments))
+  (map get-delegator-from-commitment delegator-commitments)
 )
 
-(define-private (validate-delegator-commitment (commitment-data {delegator: principal, commitment: (buff 32)}))
-  (let
-    (
-      (delegator (get delegator commitment-data))
-      (commitment (get commitment commitment-data))
-      (delegation (map-get? delegations { delegator: delegator, delegate: tx-sender }))
-    )
-    (and
-      (is-some delegation)
-      (get active (unwrap-panic delegation))
-      (is-some (map-get? commitments { poll-id: u1, voter: delegator }))
-    )
-  )
-)
-
-(define-private (is-valid-delegator-commitment (is-valid bool))
-  is-valid
+(define-private (get-delegator-from-commitment (commitment-data {delegator: principal, commitment: (buff 32)}))
+  (get delegator commitment-data)
 )
 
 (define-read-only (get-user-delegation-data (user principal))
@@ -730,3 +924,168 @@
     )
   )
 )
+
+;; Template and Category Helper Functions
+(define-private (update-template-usage (template-id uint))
+  (let
+    (
+      (template (unwrap-panic (map-get? poll-templates { template-id: template-id })))
+      (usage (get-template-usage-data template-id tx-sender))
+    )
+    (map-set poll-templates
+      { template-id: template-id }
+      (merge template { usage-count: (+ (get usage-count template) u1) })
+    )
+    
+    (map-set template-usage
+      { template-id: template-id, user: tx-sender }
+      {
+        usage-count: (+ (get usage-count usage) u1),
+        last-used-block: stacks-block-height,
+        rating: (get rating usage)
+      }
+    )
+  )
+)
+
+(define-private (update-category-poll-count (category-id uint) (poll-id uint))
+  (let
+    (
+      (category (unwrap-panic (map-get? poll-categories { category-id: category-id })))
+      (category-polls-data (get-category-polls-data category-id))
+    )
+    (map-set poll-categories
+      { category-id: category-id }
+      (merge category { poll-count: (+ (get poll-count category) u1) })
+    )
+    
+    (map-set category-polls
+      { category-id: category-id }
+      {
+        recent-polls: (unwrap-panic (as-max-len? (append (get recent-polls category-polls-data) poll-id) u50)),
+        total-polls: (+ (get total-polls category-polls-data) u1),
+        active-polls: (+ (get active-polls category-polls-data) u1)
+      }
+    )
+  )
+)
+
+(define-read-only (get-user-template-data (user principal))
+  (default-to
+    {
+      created-templates: (list),
+      template-count: u0
+    }
+    (map-get? user-templates { user: user })
+  )
+)
+
+(define-read-only (get-template-usage-data (template-id uint) (user principal))
+  (default-to
+    {
+      usage-count: u0,
+      last-used-block: u0,
+      rating: none
+    }
+    (map-get? template-usage { template-id: template-id, user: user })
+  )
+)
+
+(define-read-only (get-category-polls-data (category-id uint))
+  (default-to
+    {
+      recent-polls: (list),
+      total-polls: u0,
+      active-polls: u0
+    }
+    (map-get? category-polls { category-id: category-id })
+  )
+)
+
+;; Template and Category Discovery Functions
+(define-read-only (get-category (category-id uint))
+  (map-get? poll-categories { category-id: category-id })
+)
+
+(define-read-only (get-template (template-id uint))
+  (map-get? poll-templates { template-id: template-id })
+)
+
+(define-read-only (get-template-rating (template-id uint))
+  (let ((template (map-get? poll-templates { template-id: template-id })))
+    (match template
+      template-data
+      (some {
+        average-rating: (if (> (get rating-count template-data) u0)
+                         (/ (get rating-sum template-data) (get rating-count template-data))
+                         u0),
+        total-ratings: (get rating-count template-data),
+        usage-count: (get usage-count template-data)
+      })
+      none
+    )
+  )
+)
+
+(define-read-only (get-templates-by-category (category-id uint) (limit uint))
+  (let
+    (
+      (sample-templates (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+    )
+    (if (<= limit u10)
+      (default-to (list) (as-max-len? sample-templates u10))
+      (list)
+    )
+  )
+)
+
+(define-read-only (get-popular-templates (limit uint))
+  (let
+    (
+      (sample-templates (list u1 u2 u3 u4 u5))
+    )
+    (if (<= limit u5)
+      (default-to (list) (as-max-len? sample-templates u5))
+      (list)
+    )
+  )
+)
+
+(define-read-only (get-category-statistics (category-id uint))
+  (let
+    (
+      (category (map-get? poll-categories { category-id: category-id }))
+      (category-polls-data (get-category-polls-data category-id))
+    )
+    (match category
+      category-data
+      (some {
+        name: (get name category-data),
+        total-polls: (get total-polls category-polls-data),
+        active-polls: (get active-polls category-polls-data),
+        recent-activity: (len (get recent-polls category-polls-data))
+      })
+      none
+    )
+  )
+)
+
+(define-read-only (discover-polls-by-category (category-id uint) (limit uint))
+  (let ((category-polls-data (get-category-polls-data category-id)))
+    (if (<= limit (len (get recent-polls category-polls-data)))
+      (default-to (list) (as-max-len? (get recent-polls category-polls-data) u50))
+      (get recent-polls category-polls-data)
+    )
+  )
+)
+
+(define-read-only (get-user-template-history (user principal))
+  (let ((user-data (get-user-template-data user)))
+    {
+      created-templates: (get created-templates user-data),
+      total-created: (get template-count user-data)
+    }
+  )
+)
+
+
